@@ -1,58 +1,58 @@
-"""
-Leitores e escritores (preferencia para leitores).
-
-Objetivo: mostrar uma versao sem sincronizacao e uma versao correta com
-controle de acesso ao recurso compartilhado.
-"""
-
 import threading
+import time
 
 
-# Parametros do experimento
 BUFFER_SIZE = 6
 READERS = 4
 WRITERS = 2
 LOOPS = 40
 
-# Pequena espera para forcar intercalamentos entre as threads.
 PAUSE = 0.0005
 WAIT = threading.Event()
 
+FORCE_YIELD = 0.00001
 
-def run_incorrect() -> dict:
-	"""
-	Versao incorreta: leitores e escritores acessam sem sincronizacao.
-	A escrita ocorre em partes, permitindo leituras parciais.
-	"""
+STRESS_READERS = 100
+STRESS_WRITERS = 1
+STRESS_LOOPS = 30
+STRESS_PAUSE = 0.0001
+
+
+def run_incorrect(
+	readers: int = READERS,
+	writers: int = WRITERS,
+	loops: int = LOOPS,
+	pause: float = PAUSE,
+) -> dict:
 	shared = [0] * BUFFER_SIZE
 	inconsistencies = 0
 	total_reads = 0
 
 	def writer(writer_id: int) -> None:
 		nonlocal shared
-		for i in range(1, LOOPS + 1):
-			# Escreve o mesmo valor em todo o buffer, mas em etapas.
+		for i in range(1, loops + 1):
 			value = writer_id * 100 + i
 			for k in range(BUFFER_SIZE):
 				shared[k] = value
-				WAIT.wait(PAUSE)
+				time.sleep(FORCE_YIELD)
+				WAIT.wait(pause)
 
 	def reader() -> None:
 		nonlocal inconsistencies, total_reads
-		for _ in range(LOOPS * 2):
-			# Leitura sem lock: pode capturar parte antiga e parte nova.
+		for _ in range(loops * 2):
 			snapshot = []
 			for k in range(BUFFER_SIZE):
 				snapshot.append(shared[k])
-				WAIT.wait(PAUSE)
+				time.sleep(FORCE_YIELD)
+				WAIT.wait(pause)
 			total_reads += 1
 			if len(set(snapshot)) > 1:
 				inconsistencies += 1
 
 	threads = []
-	for w in range(WRITERS):
+	for w in range(writers):
 		threads.append(threading.Thread(target=writer, args=(w + 1,)))
-	for _ in range(READERS):
+	for _ in range(readers):
 		threads.append(threading.Thread(target=reader))
 
 	for t in threads:
@@ -66,61 +66,67 @@ def run_incorrect() -> dict:
 	}
 
 
-def run_correct() -> dict:
-	"""
-	Versao correta com preferencia para leitores:
-	- Leitores podem acessar simultaneamente.
-	- Escritor tem acesso exclusivo.
-	- Risco: escritores podem sofrer starvation se leitores nunca pararem.
-	"""
+def run_correct(
+	readers: int = READERS,
+	writers: int = WRITERS,
+	loops: int = LOOPS,
+	pause: float = PAUSE,
+	log_prefix: str = "[OK ]",
+	log_writes: bool = False,
+) -> dict:
 	shared = [0] * BUFFER_SIZE
 	inconsistencies = 0
 	total_reads = 0
-
-	# Mutex para proteger o contador de leitores.
+	readers_active = 0
 	reader_mutex = threading.Lock()
-	# Mutex de escrita: bloqueia escritores e leitores ao mesmo tempo.
-	writer_mutex = threading.Lock()
-	readers = 0
+	room_empty = threading.Lock()
+	turnstile = threading.Lock()
+
+	writer_waits = []
+	writer_counts = [0 for _ in range(writers)]
 
 	def writer(writer_id: int) -> None:
 		nonlocal shared
-		for i in range(1, LOOPS + 1):
+		for i in range(1, loops + 1):
 			value = writer_id * 100 + i
-			# Exclusao total para escrita.
-			with writer_mutex:
-				for k in range(BUFFER_SIZE):
-					shared[k] = value
-					WAIT.wait(PAUSE)
+			start_wait = time.perf_counter()
+			with turnstile:
+				with room_empty:
+					wait_time = time.perf_counter() - start_wait
+					writer_waits.append(wait_time)
+					for k in range(BUFFER_SIZE):
+						shared[k] = value
+						WAIT.wait(pause)
+			writer_counts[writer_id - 1] += 1
+			if log_writes and (i == 1 or i == loops):
+				print(f"{log_prefix} escritor {writer_id} escreveu {i}/{loops}")
 
 	def reader() -> None:
-		nonlocal inconsistencies, total_reads, readers
-		for _ in range(LOOPS * 2):
-			# Entrada de leitores (preferencia para leitores).
+		nonlocal inconsistencies, total_reads, readers_active
+		for _ in range(loops * 2):
+			with turnstile:
+				pass
 			with reader_mutex:
-				readers += 1
-				if readers == 1:
-					writer_mutex.acquire()
-
-			# Leitura concorrente (sem bloquear outros leitores).
+				readers_active += 1
+				if readers_active == 1:
+					room_empty.acquire()
 			snapshot = []
 			for k in range(BUFFER_SIZE):
 				snapshot.append(shared[k])
-				WAIT.wait(PAUSE)
+				WAIT.wait(pause)
 			total_reads += 1
 			if len(set(snapshot)) > 1:
 				inconsistencies += 1
 
-			# Saida de leitores.
 			with reader_mutex:
-				readers -= 1
-				if readers == 0:
-					writer_mutex.release()
+				readers_active -= 1
+				if readers_active == 0:
+					room_empty.release()
 
 	threads = []
-	for w in range(WRITERS):
+	for w in range(writers):
 		threads.append(threading.Thread(target=writer, args=(w + 1,)))
-	for _ in range(READERS):
+	for _ in range(readers):
 		threads.append(threading.Thread(target=reader))
 
 	for t in threads:
@@ -131,7 +137,43 @@ def run_correct() -> dict:
 	return {
 		"total_reads": total_reads,
 		"inconsistencies": inconsistencies,
+		"writer_wait_max": max(writer_waits) if writer_waits else 0.0,
+		"writer_wait_avg": (
+			sum(writer_waits) / len(writer_waits) if writer_waits else 0.0
+		),
+		"writer_counts": writer_counts,
 	}
+
+
+def run_stress_tests() -> None:
+	print("\n=== Teste de estresse (6.3) ===")
+	bad = run_incorrect(
+		readers=STRESS_READERS,
+		writers=STRESS_WRITERS,
+		loops=STRESS_LOOPS,
+		pause=STRESS_PAUSE,
+	)
+	print("[ESTRESSE] incorreto - inconsistencias:", bad["inconsistencies"])
+	assert bad["inconsistencies"] > 0
+
+	good = run_correct(
+		readers=STRESS_READERS,
+		writers=STRESS_WRITERS,
+		loops=STRESS_LOOPS,
+		pause=STRESS_PAUSE,
+		log_prefix="[ESTRESSE]",
+		log_writes=True,
+	)
+	print(
+		"[ESTRESSE] correto - espera_max:",
+		f"{good['writer_wait_max']:.6f}",
+		"espera_media:",
+		f"{good['writer_wait_avg']:.6f}",
+		"inconsistencias:",
+		good["inconsistencies"],
+	)
+	assert good["inconsistencies"] == 0
+	assert all(count == STRESS_LOOPS for count in good["writer_counts"])
 
 
 def main() -> None:
@@ -148,3 +190,4 @@ def main() -> None:
 
 if __name__ == "__main__":
 	main()
+	run_stress_tests()

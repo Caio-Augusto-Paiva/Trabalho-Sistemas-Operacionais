@@ -10,19 +10,40 @@ ARRIVAL_MAX = 0.25
 CUT_MIN = 0.05
 CUT_MAX = 0.15
 
+FORCE_YIELD = 0.00001
 
-def run_incorrect():
+STRESS_CLIENTS = 80
+STRESS_CHAIRS = 5
+STRESS_ARRIVAL_MIN = 0.0
+STRESS_ARRIVAL_MAX = 0.001
+STRESS_CUT_MIN = 0.001
+STRESS_CUT_MAX = 0.003
+
+
+def run_incorrect(
+	* ,
+	chairs: int = CHAIRS,
+	total_clients: int = TOTAL_CLIENTS,
+	arrival_min: float = ARRIVAL_MIN,
+	arrival_max: float = ARRIVAL_MAX,
+	cut_min: float = CUT_MIN,
+	cut_max: float = CUT_MAX,
+	start_barrier: threading.Barrier | None = None,
+) -> dict:
 	print("=== VERSAO INCORRETA (sem exclusao mutua) ===")
 
 	waiting = 0
 	barber_sleeping = True
 	closing = threading.Event()
 	busy_spin = 0
+	max_waiting = 0
+	errors = {"over_capacity": 0, "negative_wait": 0}
 
 	def barber():
 		nonlocal waiting, barber_sleeping, busy_spin
 		while True:
 			if waiting == 0:
+				time.sleep(FORCE_YIELD)
 				if closing.is_set():
 					print("[INCORRETO] Barbeiro encerrou o turno")
 					return
@@ -35,22 +56,27 @@ def run_incorrect():
 				time.sleep(0.001)
 				continue
 
+			time.sleep(FORCE_YIELD)
 			waiting -= 1
 			if waiting < 0:
 				print("[INCORRETO] ERRO: contador de espera negativo")
 				waiting = 0
+				errors["negative_wait"] += 1
 
 			barber_sleeping = False
 			print("[INCORRETO] Barbeiro cortando cabelo")
-			time.sleep(random.uniform(CUT_MIN, CUT_MAX))
+			time.sleep(random.uniform(cut_min, cut_max))
 
 	def client(cid):
-		nonlocal waiting, barber_sleeping
-		time.sleep(random.uniform(ARRIVAL_MIN, ARRIVAL_MAX))
+		nonlocal waiting, barber_sleeping, max_waiting
+		time.sleep(random.uniform(arrival_min, arrival_max))
+		if start_barrier is not None:
+			start_barrier.wait()
 
-		if waiting >= CHAIRS:
+		if waiting >= chairs:
+			time.sleep(FORCE_YIELD)
 			time.sleep(random.uniform(0.0, 0.01))
-			if waiting < CHAIRS:
+			if waiting < chairs:
 				print(
 					f"[INCORRETO] ERRO: Cliente {cid} foi embora, mas havia cadeira livre"
 				)
@@ -60,11 +86,14 @@ def run_incorrect():
 
 		print(f"[INCORRETO] Cliente {cid} sentou na sala de espera")
 		time.sleep(random.uniform(0.0, 0.02))
+		time.sleep(FORCE_YIELD)
 		waiting += 1
-		if waiting > CHAIRS:
+		max_waiting = max(max_waiting, waiting)
+		if waiting > chairs:
 			print(
-				f"[INCORRETO] ERRO: cadeiras ocupadas = {waiting} > {CHAIRS}"
+				f"[INCORRETO] ERRO: cadeiras ocupadas = {waiting} > {chairs}"
 			)
+			errors["over_capacity"] += 1
 
 		if barber_sleeping:
 			print(f"[INCORRETO] Cliente {cid} acorda o barbeiro")
@@ -74,7 +103,7 @@ def run_incorrect():
 	barber_thread.start()
 
 	clients = []
-	for cid in range(1, TOTAL_CLIENTS + 1):
+	for cid in range(1, total_clients + 1):
 		t = threading.Thread(target=client, args=(cid,), name=f"Cliente-{cid}")
 		clients.append(t)
 		t.start()
@@ -86,8 +115,23 @@ def run_incorrect():
 	barber_thread.join()
 	print("=== FIM DA VERSAO INCORRETA ===\n")
 
+	return {
+		"max_waiting": max_waiting,
+		"over_capacity": errors["over_capacity"],
+		"negative_wait": errors["negative_wait"],
+	}
 
-def run_correct():
+
+def run_correct(
+	* ,
+	chairs: int = CHAIRS,
+	total_clients: int = TOTAL_CLIENTS,
+	arrival_min: float = ARRIVAL_MIN,
+	arrival_max: float = ARRIVAL_MAX,
+	cut_min: float = CUT_MIN,
+	cut_max: float = CUT_MAX,
+	start_barrier: threading.Barrier | None = None,
+) -> dict:
 	print("=== VERSAO CORRETA (Dijkstra) ===")
 
 	waiting = 0
@@ -95,13 +139,7 @@ def run_correct():
 	mutex = threading.Lock()
 	customers = threading.Semaphore(0)
 	barber_ready = threading.Semaphore(0)
-
-	# Justificativa tecnica: o mutex torna atomicas as operacoes sobre
-	# waiting, eliminando a corrida entre verificar cadeiras e dormir.
-	# O semaforo customers bloqueia o barbeiro quando nao ha clientes,
-	# evitando espera ocupada. O semaforo barber_ready sincroniza o
-	# inicio do corte, garantindo que o cliente so avance quando o
-	# barbeiro estiver pronto.
+	max_waiting = 0
 
 	def barber():
 		nonlocal waiting
@@ -117,18 +155,23 @@ def run_correct():
 					print("[CORRETO] Barbeiro encerrou o turno")
 					return
 				waiting -= 1
+				assert waiting >= 0
 				barber_ready.release()
 
 			print("[CORRETO] Barbeiro cortando cabelo")
-			time.sleep(random.uniform(CUT_MIN, CUT_MAX))
+			time.sleep(random.uniform(cut_min, cut_max))
 
 	def client(cid):
-		nonlocal waiting
-		time.sleep(random.uniform(ARRIVAL_MIN, ARRIVAL_MAX))
+		nonlocal waiting, max_waiting
+		time.sleep(random.uniform(arrival_min, arrival_max))
+		if start_barrier is not None:
+			start_barrier.wait()
 
 		with mutex:
-			if waiting < CHAIRS:
+			if waiting < chairs:
 				waiting += 1
+				max_waiting = max(max_waiting, waiting)
+				assert waiting <= chairs
 				if waiting == 1:
 					print(f"[CORRETO] Cliente {cid} acorda o barbeiro")
 				print(f"[CORRETO] Cliente {cid} senta na sala de espera")
@@ -144,7 +187,7 @@ def run_correct():
 	barber_thread.start()
 
 	clients = []
-	for cid in range(1, TOTAL_CLIENTS + 1):
+	for cid in range(1, total_clients + 1):
 		t = threading.Thread(target=client, args=(cid,), name=f"Cliente-{cid}")
 		clients.append(t)
 		t.start()
@@ -157,8 +200,45 @@ def run_correct():
 	barber_thread.join()
 	print("=== FIM DA VERSAO CORRETA ===")
 
+	return {"max_waiting": max_waiting}
+
+
+def run_stress_tests() -> None:
+	print("\n=== Teste de estresse (6.5) ===")
+	barrier = threading.Barrier(STRESS_CLIENTS + 1)
+	bad = run_incorrect(
+		chairs=STRESS_CHAIRS,
+		total_clients=STRESS_CLIENTS,
+		arrival_min=STRESS_ARRIVAL_MIN,
+		arrival_max=STRESS_ARRIVAL_MAX,
+		cut_min=STRESS_CUT_MIN,
+		cut_max=STRESS_CUT_MAX,
+		start_barrier=barrier,
+	)
+	print(
+		"[ESTRESSE] incorreto - over_capacity:",
+		bad["over_capacity"],
+		"negative_wait:",
+		bad["negative_wait"],
+	)
+	assert bad["over_capacity"] > 0 or bad["negative_wait"] > 0
+
+	barrier = threading.Barrier(STRESS_CLIENTS + 1)
+	good = run_correct(
+		chairs=STRESS_CHAIRS,
+		total_clients=STRESS_CLIENTS,
+		arrival_min=STRESS_ARRIVAL_MIN,
+		arrival_max=STRESS_ARRIVAL_MAX,
+		cut_min=STRESS_CUT_MIN,
+		cut_max=STRESS_CUT_MAX,
+		start_barrier=barrier,
+	)
+	print("[ESTRESSE] correto - max_waiting:", good["max_waiting"])
+	assert good["max_waiting"] <= STRESS_CHAIRS
+
 
 if __name__ == "__main__":
 	random.seed(42)
 	run_incorrect()
 	run_correct()
+	run_stress_tests()

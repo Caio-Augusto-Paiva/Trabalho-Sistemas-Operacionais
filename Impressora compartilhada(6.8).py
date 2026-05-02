@@ -1,10 +1,3 @@
-"""Impressora compartilhada (6.8).
-
-Este arquivo demonstra duas versoes:
-1) Versao incorreta sem bloqueio (intercalacao de paginas).
-2) Versao corrigida com spooler FIFO (ordem de chegada preservada).
-"""
-
 from __future__ import annotations
 
 import threading
@@ -16,9 +9,15 @@ from typing import Deque, List
 
 LOG_LOCK = threading.Lock()
 
+FORCE_YIELD = 0.00001
+
+STRESS_PRODUCERS = 60
+STRESS_MINIMO_PAGES = 1
+STRESS_MAXIMO_PAGES = 3
+STRESS_MAX_DELAY = 0.02
+
 
 def log(mensagem: str) -> None:
-	"""Escreve logs de forma atomica para evitar linhas quebradas."""
 	with LOG_LOCK:
 		tempo = f"{time.perf_counter():.6f}"
 		print(f"{tempo} | {mensagem}")
@@ -30,20 +29,21 @@ def imprimir_sem_bloqueio(
 	barreira_inicio: threading.Barrier,
 	atraso_inicial: float,
 	atraso_por_pagina: float,
+	event_log: list[tuple[str, int]] | None = None,
 ) -> None:
-	"""Impressao direta, sem exclusao mutua e sem fila."""
 	barreira_inicio.wait()
 	time.sleep(atraso_inicial)
 	for pagina in range(1, paginas + 1):
 		log(f"[INCORRETO] Documento {documento_id} - pagina {pagina}/{paginas}")
+		if event_log is not None:
+			event_log.append((documento_id, pagina))
+		time.sleep(FORCE_YIELD)
 		time.sleep(atraso_por_pagina)
 
 
 def executar_versao_incorreta() -> None:
-	"""Executa a versao sem bloqueio para mostrar intercalacao."""
 	log("=== Versao incorreta: sem bloqueio ===")
 	documentos = [
-		# Atrasos escolhidos para provocar intercalacao deterministica
 		("A", 3, 0.00, 0.05),
 		("B", 3, 0.01, 0.02),
 	]
@@ -67,8 +67,6 @@ def executar_versao_incorreta() -> None:
 
 @dataclass(frozen=True)
 class PrintJob:
-	"""Representa um trabalho de impressao enfileirado."""
-
 	job_id: int
 	documento_id: str
 	paginas: int
@@ -76,8 +74,6 @@ class PrintJob:
 
 
 class RequestSequencer:
-	"""Gera IDs sequenciais para registrar a ordem de chegada."""
-
 	def __init__(self) -> None:
 		self._lock = threading.Lock()
 		self._next_id = 1
@@ -92,13 +88,12 @@ class RequestSequencer:
 
 
 class PrintSpooler:
-	"""Spooler FIFO com daemon de impressao."""
-
 	def __init__(self) -> None:
 		self._fila: Deque[PrintJob] = deque()
 		self._lock = threading.Lock()
 		self._not_empty = threading.Condition(self._lock)
 		self._stop = False
+		self.printed_jobs: List[int] = []
 		self._daemon = threading.Thread(
 			target=self._run,
 			name="SpoolerDaemon",
@@ -112,20 +107,17 @@ class PrintSpooler:
 			self._started = True
 
 	def enqueue(self, job: PrintJob) -> None:
-		"""Enfileira um trabalho mantendo a ordem de chegada."""
 		with self._not_empty:
 			self._fila.append(job)
 			self._not_empty.notify()
 
 	def stop_when_idle(self) -> None:
-		"""Sinaliza parada apos a fila esvaziar e aguarda o daemon."""
 		with self._not_empty:
 			self._stop = True
 			self._not_empty.notify_all()
 		self._daemon.join()
 
 	def _run(self) -> None:
-		"""Daemon que atende a fila em ordem FIFO."""
 		while True:
 			with self._not_empty:
 				while not self._fila and not self._stop:
@@ -137,6 +129,7 @@ class PrintSpooler:
 			self._print_job(job)
 
 	def _print_job(self, job: PrintJob) -> None:
+		self.printed_jobs.append(job.job_id)
 		log(
 			f"[SPOOLER] Inicia job {job.job_id} - Documento {job.documento_id} "
 			f"({job.paginas} paginas)"
@@ -156,7 +149,6 @@ def produtor(
 	paginas: int,
 	atraso: float,
 ) -> None:
-	"""Thread produtora: apenas solicita impressao, sem imprimir."""
 	time.sleep(atraso)
 	job_id = sequencer.next_job_id()
 	log(
@@ -174,14 +166,7 @@ def produtor(
 
 
 def executar_versao_corrigida() -> None:
-	"""Executa a versao com spooler FIFO e daemon."""
 	log("=== Versao corrigida: spooler FIFO ===")
-
-	# Nota tecnica:
-	# Um Mutex/Lock garante exclusao mutua, mas NAO garante ordem de atendimento.
-	# O escalonador do SO pode acordar threads em ordem diferente da chegada,
-	# levando a injustica. A fila FIFO + Condition separa o pedido do atendimento:
-	# produtores apenas enfileiram, e o daemon imprime em ordem, garantindo fairness.
 
 	spooler = PrintSpooler()
 	sequencer = RequestSequencer()
@@ -212,10 +197,87 @@ def executar_versao_corrigida() -> None:
 	log("=== Fim da versao corrigida ===")
 
 
+def detect_interleaving(events: list[tuple[str, int]]) -> bool:
+	first_index: dict[str, int] = {}
+	last_index: dict[str, int] = {}
+	for idx, (doc_id, _) in enumerate(events):
+		if doc_id not in first_index:
+			first_index[doc_id] = idx
+		last_index[doc_id] = idx
+
+	docs = list(first_index.keys())
+	for i in range(len(docs)):
+		for j in range(i + 1, len(docs)):
+			doc_a = docs[i]
+			doc_b = docs[j]
+			if first_index[doc_a] < first_index[doc_b] < last_index[doc_a]:
+				return True
+			if first_index[doc_b] < first_index[doc_a] < last_index[doc_b]:
+				return True
+	return False
+
+
+def run_stress_tests() -> None:
+	log(" Teste de estresse (6.8) ")
+	events: list[tuple[str, int]] = []
+	documentos = [
+		("A", 5, 0.00, 0.01),
+		("B", 5, 0.00, 0.01),
+		("C", 5, 0.00, 0.01),
+	]
+	barreira = threading.Barrier(len(documentos))
+	threads: List[threading.Thread] = []
+
+	for doc_id, paginas, atraso_inicial, atraso_pag in documentos:
+		thread = threading.Thread(
+			target=imprimir_sem_bloqueio,
+			name=f"Stress-{doc_id}",
+			args=(doc_id, paginas, barreira, atraso_inicial, atraso_pag, events),
+		)
+		threads.append(thread)
+		thread.start()
+
+	for thread in threads:
+		thread.join()
+
+	interleaved = detect_interleaving(events)
+	log(f"[ESTRESSE] incorreto - intercalacao: {interleaved}")
+	assert interleaved
+	spooler = PrintSpooler()
+	sequencer = RequestSequencer()
+	spooler.start()
+
+	threads = []
+	for i in range(1, STRESS_PRODUCERS + 1):
+		doc_id = f"D{i:02d}"
+		paginas = random.randint(STRESS_MINIMO_PAGES, STRESS_MAXIMO_PAGES)
+		atraso = random.uniform(0.0, STRESS_MAX_DELAY)
+		thread = threading.Thread(
+			target=produtor,
+			name=f"Prod-{doc_id}",
+			args=(spooler, sequencer, doc_id, paginas, atraso),
+		)
+		threads.append(thread)
+		thread.start()
+
+	for thread in threads:
+		thread.join()
+
+	spooler.stop_when_idle()
+
+	log(
+		f"[ESTRESSE] correto - jobs impressos: {len(spooler.printed_jobs)}"
+	)
+	log(f"[ESTRESSE] correto - ordem solicitacoes: {sequencer.ordem}")
+	log(f"[ESTRESSE] correto - ordem impressao: {spooler.printed_jobs}")
+	assert spooler.printed_jobs == sequencer.ordem
+
+
 def main() -> None:
 	executar_versao_incorreta()
 	time.sleep(0.2)
 	executar_versao_corrigida()
+	run_stress_tests()
 
 
 if __name__ == "__main__":

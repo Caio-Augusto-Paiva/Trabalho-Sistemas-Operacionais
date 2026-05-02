@@ -3,190 +3,175 @@ import time
 import random
 
 
-# ------------------------------
-# Versao incorreta (sem exclusao mutua)
-# ------------------------------
-unsafe_current_direction = None
-unsafe_cars_on_bridge = 0
+SPOTS = 5
+TOTAL_CARS = 20
+ARRIVAL_MIN = 0.0
+ARRIVAL_MAX = 0.05
+PARK_MIN = 0.02
+PARK_MAX = 0.08
+
+FORCE_YIELD = 0.00001
+
+STRESS_CARS = 80
+STRESS_SPOTS = 10
+STRESS_ARRIVAL_MIN = 0.0
+STRESS_ARRIVAL_MAX = 0.001
+STRESS_PARK_MIN = 0.001
+STRESS_PARK_MAX = 0.003
 
 
-def unsafe_cross_bridge(car_id, direction):
-	global unsafe_current_direction, unsafe_cars_on_bridge
+def run_incorrect(
+	*,
+	spots: int = SPOTS,
+	total_cars: int = TOTAL_CARS,
+	arrival_min: float = ARRIVAL_MIN,
+	arrival_max: float = ARRIVAL_MAX,
+	park_min: float = PARK_MIN,
+	park_max: float = PARK_MAX,
+	start_barrier: threading.Barrier | None = None,
+) -> dict:
+	print("=== VERSAO INCORRETA (sem exclusao mutua) ===")
+	occupied = 0
+	max_occupied = 0
+	errors = {"over_capacity": 0, "negative": 0}
+	errors_lock = threading.Lock()
 
-	time.sleep(random.uniform(0.01, 0.08))
-	print(f"[INC] carro {car_id} chegando da direcao {direction}")
+	def car(cid: int) -> None:
+		nonlocal occupied, max_occupied
+		time.sleep(random.uniform(arrival_min, arrival_max))
+		if start_barrier is not None:
+			start_barrier.wait()
 
-	# Sem exclusao mutua: dois sentidos podem entrar ao mesmo tempo.
-	if unsafe_cars_on_bridge > 0 and unsafe_current_direction != direction:
-		print(
-			f"[INC] COLISAO detectada: carro {car_id} na direcao {direction} "
-			f"entrou enquanto havia carros na direcao {unsafe_current_direction}"
-		)
+		if occupied >= spots:
+			time.sleep(FORCE_YIELD)
+			if occupied >= spots:
+				print(f"[INCORRETO] Carro {cid} foi embora (sem vaga)")
+				return
 
-	if unsafe_cars_on_bridge == 0:
-		unsafe_current_direction = direction
+		time.sleep(FORCE_YIELD)
+		occupied += 1
+		max_occupied = max(max_occupied, occupied)
+		if occupied > spots:
+			with errors_lock:
+				errors["over_capacity"] += 1
+			print(
+				f"[INCORRETO] ERRO: ocupacao {occupied} > {spots}"
+			)
 
-	unsafe_cars_on_bridge += 1
-	print(f"[INC] carro {car_id} atravessando na direcao {direction}")
-	time.sleep(random.uniform(0.05, 0.15))
-	unsafe_cars_on_bridge -= 1
-	print(f"[INC] carro {car_id} saindo da ponte")
+		time.sleep(random.uniform(park_min, park_max))
+		time.sleep(FORCE_YIELD)
+		occupied -= 1
+		if occupied < 0:
+			with errors_lock:
+				errors["negative"] += 1
+			print("[INCORRETO] ERRO: ocupacao negativa")
+			occupied = 0
 
-	if unsafe_cars_on_bridge == 0:
-		unsafe_current_direction = None
-
-
-def run_incorrect_simulation():
-	print("\n=== Versao Incorreta (sem exclusao mutua) ===")
 	threads = []
-	cars = [(i, "N") for i in range(1, 7)] + [(i + 6, "S") for i in range(1, 7)]
-	random.shuffle(cars)
+	for cid in range(1, total_cars + 1):
+		thread = threading.Thread(target=car, args=(cid,))
+		threads.append(thread)
+		thread.start()
 
-	for car_id, direction in cars:
-		t = threading.Thread(target=unsafe_cross_bridge, args=(car_id, direction))
-		t.start()
-		threads.append(t)
-		time.sleep(0.01)
+	for thread in threads:
+		thread.join()
 
-	for t in threads:
-		t.join()
-
-
-# ------------------------------
-# Versao corrigida (com prevencao de inatencao/starvation)
-# ------------------------------
-MAX_CARS_PER_TURN = 4
-bridge_lock = threading.Lock()
-bridge_condition = threading.Condition(bridge_lock)
-current_direction = None
-turn_direction = None
-cars_on_bridge = 0
-passed_in_turn = 0
-waiting = {"N": 0, "S": 0}
+	print("=== FIM DA VERSAO INCORRETA ===\n")
+	return {
+		"max_occupied": max_occupied,
+		"over_capacity": errors["over_capacity"],
+		"negative": errors["negative"],
+	}
 
 
-def other_direction(direction):
-	return "S" if direction == "N" else "N"
+def run_correct(
+	*,
+	spots: int = SPOTS,
+	total_cars: int = TOTAL_CARS,
+	arrival_min: float = ARRIVAL_MIN,
+	arrival_max: float = ARRIVAL_MAX,
+	park_min: float = PARK_MIN,
+	park_max: float = PARK_MAX,
+	start_barrier: threading.Barrier | None = None,
+) -> dict:
+	print("=== VERSAO CORRETA (semaforo + mutex) ===")
+	occupied = 0
+	max_occupied = 0
+	spots_sem = threading.Semaphore(spots)
+	mutex = threading.Lock()
 
+	def car(cid: int) -> None:
+		nonlocal occupied, max_occupied
+		time.sleep(random.uniform(arrival_min, arrival_max))
+		if start_barrier is not None:
+			start_barrier.wait()
 
-def safe_cross_bridge(car_id, direction):
-	global current_direction, turn_direction, cars_on_bridge, passed_in_turn
+		spots_sem.acquire()
+		with mutex:
+			occupied += 1
+			max_occupied = max(max_occupied, occupied)
+			assert occupied <= spots
 
-	time.sleep(random.uniform(0.01, 0.08))
-	print(f"[OK ] carro {car_id} chegando da direcao {direction}")
+		time.sleep(random.uniform(park_min, park_max))
 
-	waiting_logged = False
-	with bridge_condition:
-		waiting[direction] += 1
-		while True:
-			other = other_direction(direction)
+		with mutex:
+			occupied -= 1
+			assert occupied >= 0
+		spots_sem.release()
 
-			if cars_on_bridge == 0:
-				if turn_direction is None:
-					turn_direction = direction
-
-				if turn_direction == direction:
-					break
-
-				if waiting[turn_direction] == 0:
-					turn_direction = direction
-					break
-			else:
-				if current_direction == direction:
-					if passed_in_turn < MAX_CARS_PER_TURN or waiting[other] == 0:
-						break
-
-			if not waiting_logged:
-				blocking_direction = (
-					current_direction
-					if current_direction is not None
-					else turn_direction
-				)
-				print(
-					f"[OK ] carro {car_id} aguardando; ponte no sentido {blocking_direction}"
-				)
-				waiting_logged = True
-
-			bridge_condition.wait()
-
-		waiting[direction] -= 1
-
-		if cars_on_bridge == 0:
-			current_direction = direction
-			passed_in_turn = 0
-
-		cars_on_bridge += 1
-		passed_in_turn += 1
-		print(f"[OK ] carro {car_id} atravessando na direcao {direction}")
-
-	time.sleep(random.uniform(0.06, 0.18))
-
-	with bridge_condition:
-		cars_on_bridge -= 1
-		print(f"[OK ] carro {car_id} saindo da ponte")
-
-		if cars_on_bridge == 0:
-			other = other_direction(direction)
-			switch_to_other = False
-
-			if waiting[other] > 0 and passed_in_turn >= MAX_CARS_PER_TURN:
-				switch_to_other = True
-			elif waiting[other] > 0 and waiting[direction] == 0:
-				switch_to_other = True
-
-			if switch_to_other:
-				turn_direction = other
-				print(
-					f"[OK ] alternancia de fluxo: agora sentido {turn_direction}"
-				)
-			elif waiting[direction] > 0:
-				turn_direction = direction
-			else:
-				turn_direction = None
-
-			current_direction = None
-			passed_in_turn = 0
-
-		bridge_condition.notify_all()
-
-
-def run_correct_simulation():
-	print("\n=== Versao Corrigida (com prevencao de starvation) ===")
 	threads = []
-	cars = []
+	for cid in range(1, total_cars + 1):
+		thread = threading.Thread(target=car, args=(cid,))
+		threads.append(thread)
+		thread.start()
 
-	# Fluxo propositalmente desequilibrado para forcar alternancia.
-	for i in range(1, 21):
-		cars.append((i, "N"))
-	for i in range(21, 24):
-		cars.append((i, "S"))
+	for thread in threads:
+		thread.join()
 
-	random.shuffle(cars)
-
-	for car_id, direction in cars:
-		t = threading.Thread(target=safe_cross_bridge, args=(car_id, direction))
-		t.start()
-		threads.append(t)
-		time.sleep(0.01)
-
-	for t in threads:
-		t.join()
+	print("=== FIM DA VERSAO CORRETA ===")
+	return {"max_occupied": max_occupied}
 
 
-def main():
+def run_stress_tests() -> None:
+	print("\n=== Teste de estresse (6.7) ===")
+	barrier = threading.Barrier(STRESS_CARS + 1)
+	bad = run_incorrect(
+		spots=STRESS_SPOTS,
+		total_cars=STRESS_CARS,
+		arrival_min=STRESS_ARRIVAL_MIN,
+		arrival_max=STRESS_ARRIVAL_MAX,
+		park_min=STRESS_PARK_MIN,
+		park_max=STRESS_PARK_MAX,
+		start_barrier=barrier,
+	)
+	print(
+		"[ESTRESSE] incorreto - over_capacity:",
+		bad["over_capacity"],
+		"negative:",
+		bad["negative"],
+	)
+	assert bad["over_capacity"] > 0 or bad["negative"] > 0
+
+	barrier = threading.Barrier(STRESS_CARS + 1)
+	good = run_correct(
+		spots=STRESS_SPOTS,
+		total_cars=STRESS_CARS,
+		arrival_min=STRESS_ARRIVAL_MIN,
+		arrival_max=STRESS_ARRIVAL_MAX,
+		park_min=STRESS_PARK_MIN,
+		park_max=STRESS_PARK_MAX,
+		start_barrier=barrier,
+	)
+	print("[ESTRESSE] correto - max_occupied:", good["max_occupied"])
+	assert good["max_occupied"] <= STRESS_SPOTS
+
+
+def main() -> None:
 	random.seed(42)
-	run_incorrect_simulation()
-	run_correct_simulation()
+	run_incorrect()
+	run_correct()
+	run_stress_tests()
 
 
 if __name__ == "__main__":
 	main()
-
-
-# Justificativa tecnica:
-# A condicao (Condition) protege as variaveis compartilhadas e bloqueia
-# a entrada de carros de direcoes opostas enquanto ha carros na ponte.
-# Para evitar starvation, contamos quantos carros atravessam em cada turno
-# (MAX_CARS_PER_TURN). Se o limite e atingido e ha carros aguardando no
-# outro sentido, o fluxo e alternado assim que a ponte fica vazia, garantindo
-# que ambos os lados avancem mesmo com chegada continua de um unico sentido.
