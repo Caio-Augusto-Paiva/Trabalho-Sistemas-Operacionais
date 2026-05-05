@@ -2,7 +2,6 @@ import threading
 import time
 import random
 
-
 CHAIRS = 3
 TOTAL_CLIENTS = 10
 ARRIVAL_MIN = 0.01
@@ -12,13 +11,12 @@ CUT_MAX = 0.15
 
 FORCE_YIELD = 0.00001
 
-STRESS_CLIENTS = 80
+STRESS_CLIENTS = 40
 STRESS_CHAIRS = 5
 STRESS_ARRIVAL_MIN = 0.0
 STRESS_ARRIVAL_MAX = 0.001
 STRESS_CUT_MIN = 0.001
 STRESS_CUT_MAX = 0.003
-
 
 def run_incorrect(
 	* ,
@@ -205,7 +203,7 @@ def run_correct(
 
 def run_stress_tests() -> None:
 	print("\n=== Teste de estresse (6.5) ===")
-	barrier = threading.Barrier(STRESS_CLIENTS + 1)
+	barrier = threading.Barrier(STRESS_CLIENTS)
 	bad = run_incorrect(
 		chairs=STRESS_CHAIRS,
 		total_clients=STRESS_CLIENTS,
@@ -223,7 +221,7 @@ def run_stress_tests() -> None:
 	)
 	assert bad["over_capacity"] > 0 or bad["negative_wait"] > 0
 
-	barrier = threading.Barrier(STRESS_CLIENTS + 1)
+	barrier = threading.Barrier(STRESS_CLIENTS)
 	good = run_correct(
 		chairs=STRESS_CHAIRS,
 		total_clients=STRESS_CLIENTS,

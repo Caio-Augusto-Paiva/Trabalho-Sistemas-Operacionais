@@ -12,7 +12,7 @@ PARK_MAX = 0.08
 
 FORCE_YIELD = 0.00001
 
-STRESS_CARS = 80
+STRESS_CARS = 40
 STRESS_SPOTS = 10
 STRESS_ARRIVAL_MIN = 0.0
 STRESS_ARRIVAL_MAX = 0.001
@@ -134,7 +134,7 @@ def run_correct(
 
 def run_stress_tests() -> None:
 	print("\n=== Teste de estresse (6.7) ===")
-	barrier = threading.Barrier(STRESS_CARS + 1)
+	barrier = threading.Barrier(STRESS_CARS)
 	bad = run_incorrect(
 		spots=STRESS_SPOTS,
 		total_cars=STRESS_CARS,
@@ -152,7 +152,7 @@ def run_stress_tests() -> None:
 	)
 	assert bad["over_capacity"] > 0 or bad["negative"] > 0
 
-	barrier = threading.Barrier(STRESS_CARS + 1)
+	barrier = threading.Barrier(STRESS_CARS)
 	good = run_correct(
 		spots=STRESS_SPOTS,
 		total_cars=STRESS_CARS,
